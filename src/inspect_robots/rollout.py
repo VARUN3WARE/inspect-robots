@@ -17,6 +17,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+import numpy.typing as npt
 
 from inspect_robots.approver import Approver
 from inspect_robots.controller import _INFER_KEY, Controller
@@ -28,7 +29,7 @@ from inspect_robots.errors import (
     SafetyAbort,
     _CancelledTrial,
 )
-from inspect_robots.frames import FrameRef, FrameStore
+from inspect_robots.frames import DepthFrameRef, FrameRef, FrameStore
 from inspect_robots.policy import Policy
 from inspect_robots.scene import Scene
 from inspect_robots.transcript import (
@@ -69,9 +70,10 @@ class StepRecord:
     """One step of a recorded trajectory.
 
     When a [`FrameStore`][inspect_robots.frames.FrameStore] is used, both
-    ``observation`` and ``result.observation`` have their images stripped.
-    ``image_refs`` and ``result_image_refs`` hold the corresponding on-disk
-    handles instead (R5).
+    ``observation`` and ``result.observation`` have their images stripped, and
+    per-camera ``{camera}_depth`` entries are removed from ``extra``.
+    ``image_refs`` and ``result_image_refs`` hold the RGB handles.
+    ``depth_refs`` and ``result_depth_refs`` hold metric depth handles (R5).
     """
 
     t: int
@@ -80,6 +82,8 @@ class StepRecord:
     result: StepResult
     image_refs: Mapping[str, FrameRef] | None = None
     result_image_refs: Mapping[str, FrameRef] | None = None
+    depth_refs: Mapping[str, DepthFrameRef] | None = None
+    result_depth_refs: Mapping[str, DepthFrameRef] | None = None
 
 
 @dataclass
@@ -218,14 +222,81 @@ def _non_finite_detail(data: object) -> str | None:
     return "contains inf"
 
 
+def _resolve_depth(observation: Observation) -> dict[str, npt.NDArray[np.float64] | str]:
+    """Resolve each camera's ``{camera}_depth`` entry once.
+
+    Matches the agent plugin's contract: a 2-D array passes through, a
+    zero-argument callable is called once, and any ordinary failure becomes
+    text instead of raising. ``SafetyAbort`` and ``EmbodimentFault`` propagate.
+    An entry that is already failure text is kept as-is.
+    """
+    resolved: dict[str, npt.NDArray[np.float64] | str] = {}
+    for name in observation.images:
+        key = f"{name}_depth"
+        if key not in observation.extra:
+            continue
+        value = observation.extra[key]
+        if isinstance(value, str):
+            resolved[name] = value
+            continue
+        try:
+            if callable(value):
+                value = value()
+            depth = np.asarray(value, dtype=np.float64)
+            if depth.ndim != 2:
+                raise ValueError(f"expected a 2-D array, got shape {depth.shape}")
+        except (SafetyAbort, EmbodimentFault):
+            raise
+        except Exception as exc:
+            resolved[name] = f"depth {name!r} unavailable: {exc}"
+        else:
+            resolved[name] = depth
+    return resolved
+
+
+def _with_resolved_depth(
+    observation: Observation, resolved: Mapping[str, npt.NDArray[np.float64] | str]
+) -> Observation:
+    """Replace depth thunks with the arrays or failure text resolved once."""
+    if not resolved:
+        return observation
+    extra = dict(observation.extra)
+    for name, entry in resolved.items():
+        extra[f"{name}_depth"] = entry
+    return replace(observation, extra=extra)
+
+
 def _store_frames(
     frame_store: FrameStore | None, trial_id: str, t: int, obs: Observation
-) -> tuple[Observation, Mapping[str, FrameRef] | None]:
-    """If a frame store is configured, stream images to disk and strip them."""
+) -> tuple[
+    Observation,
+    Observation,
+    Mapping[str, FrameRef] | None,
+    Mapping[str, DepthFrameRef] | None,
+]:
+    """Stream RGB and metric depth, returning the policy view and the record view.
+
+    Without a frame store, or with no images, both views are ``obs`` and nothing
+    is written. With a store, depth thunks are resolved once into the policy
+    view. The record view drops images and ``{camera}_depth`` keys. Only
+    successful 2-D arrays are written, as float32 under ``depth/``.
+    """
     if frame_store is None or not obs.images:
-        return obs, None
-    refs = {cam: frame_store.put(trial_id, t, cam, image) for cam, image in obs.images.items()}
-    return replace(obs, images={}), refs
+        return obs, obs, None, None
+    resolved = _resolve_depth(obs)
+    policy_obs = _with_resolved_depth(obs, resolved)
+    refs = {
+        cam: frame_store.put(trial_id, t, cam, image) for cam, image in policy_obs.images.items()
+    }
+    depth_refs: dict[str, DepthFrameRef] = {}
+    for name, entry in resolved.items():
+        if isinstance(entry, np.ndarray):
+            depth_refs[name] = frame_store.put_depth(trial_id, t, name, entry)
+    extra = policy_obs.extra
+    depth_keys = {f"{name}_depth" for name in resolved}
+    if depth_keys:
+        extra = {key: value for key, value in extra.items() if key not in depth_keys}
+    return policy_obs, replace(policy_obs, images={}, extra=extra), refs, depth_refs or None
 
 
 def _end_operator_trial(operator_input: OperatorInput | None) -> None:
@@ -278,6 +349,14 @@ def rollout(
     embodiment that needs real-time cadence paces itself inside ``step()`` and
     declares the ``"self_paced"`` capability to document that it does (see
     [`Embodiment`][inspect_robots.embodiment.Embodiment]).
+
+    When ``frame_store`` is set, each camera's ``extra["{camera}_depth"]`` entry
+    (a 2-D float array or a zero-argument callable) is resolved once, before the
+    policy sees that observation. Successful maps are written as float32 under
+    the store's ``depth/`` directory. The persisted step drops those keys.
+    An ordinary resolution failure becomes text and is not written.
+    ``SafetyAbort`` and ``EmbodimentFault`` from that resolution propagate.
+    Without a frame store, depth entries are left untouched.
     """
     if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
         raise ValueError(f"max_steps must be an integer >= 1, got {max_steps!r}")
@@ -322,7 +401,11 @@ def rollout(
                     stacklevel=2,
                 )
 
-        obs_rec, refs = _store_frames(frame_store, trial_id, 0, obs)
+        try:
+            obs, obs_rec, refs, depth_refs = _store_frames(frame_store, trial_id, 0, obs)
+        except (SafetyAbort, EmbodimentFault) as exc:
+            _record_failure(record, exc, 0)
+            raise
         t = 0
         while t < max_steps:
             poll = None
@@ -485,9 +568,13 @@ def rollout(
                 raise _record_failure(record, EmbodimentFault(str(exc)), t) from exc
 
             sink.log_step(t, obs, action, result)
-            result_obs_rec, result_refs = _store_frames(
-                frame_store, trial_id, t + 1, result.observation
-            )
+            try:
+                next_obs, result_obs_rec, result_refs, result_depth_refs = _store_frames(
+                    frame_store, trial_id, t + 1, result.observation
+                )
+            except (SafetyAbort, EmbodimentFault) as exc:
+                _record_failure(record, exc, t)
+                raise
             result_rec = (
                 result
                 if result_obs_rec is result.observation
@@ -501,6 +588,8 @@ def rollout(
                     result=result_rec,
                     image_refs=refs,
                     result_image_refs=result_refs,
+                    depth_refs=depth_refs,
+                    result_depth_refs=result_depth_refs,
                 )
             )
             record.events.append(
@@ -523,9 +612,10 @@ def rollout(
                 record.truncated = True
                 record.termination_reason = stop_reason
                 break
-            obs = result.observation
+            obs = next_obs
             obs_rec = result_obs_rec
             refs = result_refs
+            depth_refs = result_depth_refs
         else:
             record.truncated = True
             record.termination_reason = "max_steps"
