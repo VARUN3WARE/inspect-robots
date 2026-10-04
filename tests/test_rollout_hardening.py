@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -404,24 +405,70 @@ def test_frame_store_depth_safety_abort_halts_before_motion(tmp_path: Path) -> N
     assert info.value.record.error == "SafetyAbort: depth e-stop"
 
 
-def test_frame_store_depth_fault_after_a_step_halts(tmp_path: Path) -> None:
-    calls = 0
+@pytest.mark.parametrize("halt", [SafetyAbort, EmbodimentFault])
+def test_frame_store_depth_halt_after_a_step_keeps_the_action(
+    tmp_path: Path, halt: type[SafetyAbort] | type[EmbodimentFault]
+) -> None:
+    def make_depth() -> tuple[object, dict[str, int]]:
+        calls = {"n": 0}
 
-    def depth() -> np.ndarray:
-        nonlocal calls
-        calls += 1
-        if calls > 1:
-            raise EmbodimentFault("depth sensor fault")
-        return np.ones((2, 2), dtype=np.float64)
+        def depth() -> np.ndarray:
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise halt("depth halt")
+            return np.ones((2, 2), dtype=np.float64)
 
+        return depth, calls
+
+    depth, calls = make_depth()
     store = FrameStore(str(tmp_path / "frames"))
-    with pytest.raises(EmbodimentFault, match="depth sensor fault") as info:
+    with pytest.raises(halt, match="depth halt") as info:
         _run(_DepthPolicy(), _DepthEmbodiment(depth), frame_store=store)
-    assert calls == 2
-    assert info.value.record is not None
-    assert info.value.record.status == "error"
-    assert info.value.record.steps == []
-    assert info.value.record.error == "EmbodimentFault: depth sensor fault"
+    assert calls["n"] == 2
+    record = info.value.record
+    assert record is not None
+    assert record.status == "error"
+    assert record.error == f"{halt.__name__}: depth halt"
+    assert len(record.steps) == 1
+    step = record.steps[0]
+    assert step.t == 0
+    assert int(np.asarray(step.action.data).size) == 2
+    assert step.result_image_refs is not None
+    assert set(step.result_image_refs) == {"top", "wrist"}
+    assert step.result_image_refs["top"].load().dtype == np.uint8
+    assert step.result_depth_refs is None
+    assert not step.result.observation.images
+    assert "top_depth" not in step.result.observation.extra
+    assert [event.kind for event in record.events if event.kind in {"step", "error"}] == [
+        "step",
+        "error",
+    ]
+    depth_names = [path.name for path in (store.root / "depth").glob("*.npy")]
+    assert any(name.endswith("_000000.npy") for name in depth_names)
+    assert not any(name.endswith("_000001.npy") for name in depth_names)
+
+    eval_depth, _eval_calls = make_depth()
+    (log,) = eval(
+        Task(
+            name="demo",
+            scenes=[Scene(id="s", instruction="reach", init_seed=0)],
+            scorer=success_at_end(),
+            max_steps=40,
+        ),
+        _DepthPolicy(),
+        _DepthEmbodiment(eval_depth),
+        log_dir=str(tmp_path / "logs"),
+        store_frames=True,
+    )
+    assert log.status == "error"
+    assert log.stats.total_steps == 1
+    actions_rel = log.samples[0].trial_metadata[0]["actions"]
+    rows = [
+        json.loads(line)
+        for line in (tmp_path / "logs" / actions_rel).read_text(encoding="utf-8").splitlines()
+    ]
+    assert rows[0]["kind"] == "header"
+    assert [row["t"] for row in rows[1:]] == [0]
 
 
 def test_per_trial_seed_varies_by_epoch() -> None:

@@ -266,6 +266,21 @@ def _with_resolved_depth(
     return replace(observation, extra=extra)
 
 
+class _DepthStoreHalt(Exception):
+    """Depth resolution raised a halt after this observation's RGB was stored.
+
+    ``refs`` are the RGB frames already on disk. The failing depth callable
+    must not be invoked again.
+    """
+
+    def __init__(
+        self, original: SafetyAbort | EmbodimentFault, refs: Mapping[str, FrameRef]
+    ) -> None:
+        super().__init__(str(original))
+        self.original = original
+        self.refs = refs
+
+
 def _store_frames(
     frame_store: FrameStore | None, trial_id: str, t: int, obs: Observation
 ) -> tuple[
@@ -283,11 +298,13 @@ def _store_frames(
     """
     if frame_store is None or not obs.images:
         return obs, obs, None, None
-    resolved = _resolve_depth(obs)
+    # RGB first, so a later depth halt still has the completed camera frames.
+    refs = {cam: frame_store.put(trial_id, t, cam, image) for cam, image in obs.images.items()}
+    try:
+        resolved = _resolve_depth(obs)
+    except (SafetyAbort, EmbodimentFault) as exc:
+        raise _DepthStoreHalt(exc, refs) from exc
     policy_obs = _with_resolved_depth(obs, resolved)
-    refs = {
-        cam: frame_store.put(trial_id, t, cam, image) for cam, image in policy_obs.images.items()
-    }
     depth_refs: dict[str, DepthFrameRef] = {}
     for name, entry in resolved.items():
         if isinstance(entry, np.ndarray):
@@ -356,6 +373,9 @@ def rollout(
     the store's ``depth/`` directory. The persisted step drops those keys.
     An ordinary resolution failure becomes text and is not written.
     ``SafetyAbort`` and ``EmbodimentFault`` from that resolution propagate.
+    If the action for that step already ran, the step, its step event, and the
+    RGB frames stay on the partial trial. The failing depth callable is not
+    called again.
     Without a frame store, depth entries are left untouched.
     """
     if not isinstance(max_steps, int) or isinstance(max_steps, bool) or max_steps < 1:
@@ -403,9 +423,10 @@ def rollout(
 
         try:
             obs, obs_rec, refs, depth_refs = _store_frames(frame_store, trial_id, 0, obs)
-        except (SafetyAbort, EmbodimentFault) as exc:
-            _record_failure(record, exc, 0)
-            raise
+        except _DepthStoreHalt as halt:
+            # No action has run yet. Keep the reset RGB already stored.
+            _record_failure(record, halt.original, 0)
+            raise halt.original from None
         t = 0
         while t < max_steps:
             poll = None
@@ -572,9 +593,35 @@ def rollout(
                 next_obs, result_obs_rec, result_refs, result_depth_refs = _store_frames(
                     frame_store, trial_id, t + 1, result.observation
                 )
-            except (SafetyAbort, EmbodimentFault) as exc:
-                _record_failure(record, exc, t)
-                raise
+            except _DepthStoreHalt as halt:
+                # The action already ran. Keep it, its step event, and the RGB
+                # frames. Do not call the failing depth callable again.
+                depth_keys = {f"{name}_depth" for name in result.observation.images}
+                result_extra = {
+                    key: value
+                    for key, value in result.observation.extra.items()
+                    if key not in depth_keys
+                }
+                record.steps.append(
+                    StepRecord(
+                        t=t,
+                        observation=obs_rec,
+                        action=action,
+                        result=replace(
+                            result,
+                            observation=replace(result.observation, images={}, extra=result_extra),
+                        ),
+                        image_refs=refs,
+                        result_image_refs=halt.refs,
+                        depth_refs=depth_refs,
+                        result_depth_refs=None,
+                    )
+                )
+                record.events.append(
+                    step_event(t, result.terminated, result.truncated, result.termination_reason)
+                )
+                _record_failure(record, halt.original, t)
+                raise halt.original from None
             result_rec = (
                 result
                 if result_obs_rec is result.observation

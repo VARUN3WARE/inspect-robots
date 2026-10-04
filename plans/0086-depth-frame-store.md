@@ -20,7 +20,9 @@ is invoked once, before `policy.act` sees that observation. A 2-D array passes
 through. An ordinary failure, or an entry that is already failure text,
 becomes a string on the policy-facing observation and is not written.
 `SafetyAbort` and `EmbodimentFault` from a depth callable propagate and are
-recorded on the trial. The agent plugin's
+recorded on the trial. RGB for that observation is written first. If the
+action already ran, the step, its step event, and those RGB frames stay on
+the partial trial, and the failing callable is not called again. The agent plugin's
 `resolve_depth` keeps that string instead of parsing it again.
 
 Successful maps are stored as float32 under `frames/<run>/depth/`, using the
